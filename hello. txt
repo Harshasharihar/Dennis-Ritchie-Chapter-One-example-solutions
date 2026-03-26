@@ -1,0 +1,511 @@
+Here is the full content of the text doc 
+# =============================================================================
+# ufs_qos_test.txt
+# UFS UniPro QoS Patch — Stress Test + Regression Test Script
+#
+# PURPOSE:
+#   1. STRESS TEST  — Drive the UFS link hard to trigger real QoS events
+#                     (DME counter increments, uevents, PA_INIT cycles)
+#   2. REGRESSION   — Verify the patch does NOT hurt normal UFS performance
+#                     (IOPS, throughput, latency must stay within baseline)
+#
+# USAGE (run from host PC with device connected via ADB):
+#   chmod +x ufs_qos_test.sh
+#   ./ufs_qos_test.sh [OPTIONS]
+#
+# OPTIONS:
+#   --device <serial>   ADB device serial (default: first connected device)
+#   --bsg    <path>     UFS BSG node    (default: /dev/ufs-bsg0)
+#   --block  <path>     UFS block device (default: /dev/block/sda)
+#   --tmpdir <path>     Temp dir on device (default: /data/local/tmp)
+#   --stress-dur <sec>  Duration of each stress phase in seconds (default: 120)
+#   --regr-dur   <sec>  Duration of each regression fio run in seconds (default: 60)
+#   --threshold  <%>    Max allowed performance drop in regression (default: 10)
+#   --skip-stress       Skip stress tests, run regression only
+#   --skip-regression   Skip regression tests, run stress only
+#   --help              Show this help
+#
+# REQUIREMENTS (on host):
+#   adb, bc
+#
+# REQUIREMENTS (pushed to device automatically by this script):
+#   fio binary for Android (arm64)  → place at ./tools/fio before running
+#   ufs-utils binary for Android    → place at ./tools/ufs-utils before running
+#
+# REPORT:
+#   A full HTML report is saved to ./ufs_qos_report_<timestamp>.html
+#
+# =============================================================================
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLOUR CODES
+# ─────────────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEFAULT CONFIG  (override via CLI flags)
+# ─────────────────────────────────────────────────────────────────────────────
+ADB_SERIAL=""
+BSG_PATH="/dev/ufs-bsg0"
+BLOCK_DEV="/dev/block/sda"
+TMP_DIR="/data/local/tmp"
+STRESS_DUR=120          # seconds per stress phase
+REGR_DUR=60             # seconds per fio regression run
+REGR_THRESHOLD=10       # max % performance drop allowed (regression pass/fail)
+SKIP_STRESS=false
+SKIP_REGRESSION=false
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+REPORT_FILE="./ufs_qos_report_${TIMESTAMP}.html"
+LOG_FILE="./ufs_qos_log_${TIMESTAMP}.txt"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PARSE CLI ARGS
+# ─────────────────────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --device)    ADB_SERIAL="$2"; shift 2 ;;
+        --bsg)       BSG_PATH="$2";   shift 2 ;;
+        --block)     BLOCK_DEV="$2";  shift 2 ;;
+        --tmpdir)    TMP_DIR="$2";    shift 2 ;;
+        --stress-dur) STRESS_DUR="$2"; shift 2 ;;
+        --regr-dur)  REGR_DUR="$2";   shift 2 ;;
+        --threshold) REGR_THRESHOLD="$2"; shift 2 ;;
+        --skip-stress)      SKIP_STRESS=true;     shift ;;
+        --skip-regression)  SKIP_REGRESSION=true; shift ;;
+        --help)
+            sed -n '/^# USAGE/,/^# ====/p' "$0" | head -30
+            exit 0 ;;
+        *) echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# Build ADB command prefix
+ADB="adb"
+[[ -n "$ADB_SERIAL" ]] && ADB="adb -s $ADB_SERIAL"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+log()      { echo -e "${CYAN}[$(date +%H:%M:%S)]${RESET} $*" | tee -a "$LOG_FILE"; }
+pass()     { echo -e "${GREEN}  ✔ PASS${RESET} $*"           | tee -a "$LOG_FILE"; }
+fail()     { echo -e "${RED}  ✘ FAIL${RESET} $*"             | tee -a "$LOG_FILE"; }
+warn()     { echo -e "${YELLOW}  ⚠ WARN${RESET} $*"          | tee -a "$LOG_FILE"; }
+section()  { echo -e "\n${BOLD}━━━ $* ━━━${RESET}\n"         | tee -a "$LOG_FILE"; }
+
+# Redirect all adb output to log too
+adb_shell() { $ADB shell "$@" 2>>"$LOG_FILE"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML REPORT HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+HTML_BODY=""
+
+html_section() {
+    HTML_BODY+="<h2>$1</h2>"
+}
+
+html_row() {
+    local color="black"
+    case "$3" in
+        PASS) color="green" ;;
+        FAIL) color="red"   ;;
+        WARN) color="orange";;
+        INFO) color="#555"  ;;
+    esac
+    HTML_BODY+="<tr><td>$1</td><td><b style='color:${color}'>$2</b></td><td style='color:${color}'>$3</td></tr>"
+}
+
+html_table_start() { HTML_BODY+="<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;width:100%;margin-bottom:20px'><tr style='background:#ddd'><th>Test</th><th>Value</th><th>Result</th></tr>"; }
+html_table_end()   { HTML_BODY+="</table>"; }
+html_code() { HTML_BODY+="<pre style='background:#f4f4f4;padding:10px;border-radius:4px;overflow-x:auto'>$1</pre>"; }
+
+write_report() {
+    cat > "$REPORT_FILE" <<EOF
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>UFS QoS Test Report — ${TIMESTAMP}</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 40px; color: #222; }
+  h1   { background: #1a237e; color: white; padding: 16px; border-radius: 6px; }
+  h2   { color: #1a237e; border-bottom: 2px solid #1a237e; padding-bottom: 4px; }
+  table { font-size: 14px; }
+  td,th { padding: 6px 12px; }
+  tr:nth-child(even) { background: #f9f9f9; }
+  pre  { font-size: 12px; }
+  .summary { font-size: 18px; font-weight: bold; padding: 12px;
+             border-radius: 6px; margin: 20px 0; }
+  .summary.pass { background: #e8f5e9; color: green; }
+  .summary.fail { background: #ffebee; color: red; }
+</style>
+</head>
+<body>
+<h1>UFS UniPro QoS Patch — Test Report</h1>
+<p><b>Date:</b> $(date)<br>
+   <b>Device:</b> $DEVICE_MODEL<br>
+   <b>Kernel:</b> $KERNEL_VER<br>
+   <b>BSG node:</b> $BSG_PATH<br>
+   <b>Block dev:</b> $BLOCK_DEV</p>
+${HTML_BODY}
+</body>
+</html>
+EOF
+    log "Report saved → $REPORT_FILE"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 0: PRE-FLIGHT CHECKS
+# ─────────────────────────────────────────────────────────────────────────────
+section "PRE-FLIGHT CHECKS"
+
+if ! $ADB get-state &>/dev/null; then
+    fail "No ADB device found. Connect device and retry."
+    exit 1
+fi
+pass "ADB device found"
+
+DEVICE_MODEL=$(adb_shell getprop ro.product.model | tr -d '\r')
+KERNEL_VER=$(adb_shell uname -r | tr -d '\r')
+log "Device : $DEVICE_MODEL"
+log "Kernel : $KERNEL_VER"
+
+if ! adb_shell "[ -c $BSG_PATH ]" 2>/dev/null; then
+    warn "BSG node $BSG_PATH not found — DME counter reads will be skipped"
+    BSG_AVAILABLE=false
+else
+    BSG_AVAILABLE=true
+    pass "BSG node $BSG_PATH found"
+fi
+
+for tool in fio ufs-utils; do
+    if [[ -f "./tools/$tool" ]]; then
+        $ADB push "./tools/$tool" "$TMP_DIR/$tool" >>"$LOG_FILE" 2>&1
+        adb_shell "chmod +x $TMP_DIR/$tool"
+        pass "Pushed $tool to device"
+    else
+        warn "./tools/$tool not found locally — some tests may be skipped"
+    fi
+done
+
+FIO_CMD="$TMP_DIR/fio"
+if ! adb_shell "$FIO_CMD --version" &>/dev/null; then
+    if adb_shell "fio --version" &>/dev/null; then
+        FIO_CMD="fio"
+        pass "System fio found"
+    else
+        fail "fio not available on device — regression tests will be skipped"
+        SKIP_REGRESSION=true
+    fi
+fi
+
+UFS_CMD="$TMP_DIR/ufs-utils"
+if ! adb_shell "$UFS_CMD --version" &>/dev/null 2>&1; then
+    UFS_AVAILABLE=false
+    warn "ufs-utils not available — DME counter tests will be skipped"
+else
+    UFS_AVAILABLE=true
+    pass "ufs-utils found on device"
+fi
+
+UFS_STATS_PATH=$(adb_shell "find /sys -name 'err_stats' 2>/dev/null | head -1 | xargs dirname" 2>/dev/null | tr -d '\r')
+if [[ -z "$UFS_STATS_PATH" ]]; then
+    UFS_STATS_PATH=$(adb_shell "find /sys/devices -path '*ufshcd*' -name 'ufs_stats' 2>/dev/null | head -1" 2>/dev/null | tr -d '\r')
+fi
+if [[ -n "$UFS_STATS_PATH" ]]; then
+    pass "UFS sysfs stats path: $UFS_STATS_PATH"
+else
+    warn "UFS sysfs stats path not found — sysfs counter tests skipped"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: Read a single DME QoS attribute
+# ─────────────────────────────────────────────────────────────────────────────
+read_dme_attr() {
+    local attr="$1"
+    if [[ "$UFS_AVAILABLE" == true && "$BSG_AVAILABLE" == true ]]; then
+        local val
+        val=$(adb_shell "$UFS_CMD uic -t 2 -i $attr -p $BSG_PATH 2>/dev/null" \
+              | grep -oP ':\s*\K[0-9]+' | head -1 | tr -d '\r')
+        echo "${val:-N/A}"
+    else
+        echo "N/A"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: Uevent listener
+# ─────────────────────────────────────────────────────────────────────────────
+UEVENT_LOG="$TMP_DIR/ufs_uevent_capture.txt"
+start_uevent_listener() {
+    adb_shell "udevadm monitor --kernel --subsystem-match=ufs > $UEVENT_LOG 2>&1 &"
+    UEVENT_PID=$(adb_shell "pgrep -f 'udevadm monitor' | tail -1" | tr -d '\r')
+    log "Uevent listener started (PID $UEVENT_PID)"
+}
+
+stop_uevent_listener() {
+    adb_shell "kill $UEVENT_PID 2>/dev/null || true"
+    log "Uevent listener stopped"
+}
+
+count_uevents() {
+    local count
+    count=$(adb_shell "grep -c 'SUBSYSTEM=ufs\|ufs-bsg\|(ufs)' $UEVENT_LOG 2>/dev/null || echo 0" | tr -d '\r')
+    echo "${count:-0}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: Run fio and parse results
+# ─────────────────────────────────────────────────────────────────────────────
+FIO_JSON="$TMP_DIR/fio_result.json"
+
+run_fio() {
+    local name="$1" rw="$2" bs="$3" iodepth="$4" numjobs="$5" runtime="$6"
+    log "  Running fio: name=$name rw=$rw bs=$bs iodepth=$iodepth jobs=$numjobs runtime=${runtime}s"
+
+    adb_shell "$FIO_CMD \
+        --name=$name \
+        --ioengine=libaio \
+        --rw=$rw \
+        --bs=$bs \
+        --iodepth=$iodepth \
+        --numjobs=$numjobs \
+        --direct=1 \
+        --size=1G \
+        --runtime=$runtime \
+        --time_based \
+        --filename=$BLOCK_DEV \
+        --output-format=json \
+        --output=$FIO_JSON \
+        --group_reporting \
+        2>/dev/null"
+
+    local json
+    json=$($ADB shell cat "$FIO_JSON" 2>/dev/null | tr -d '\r')
+
+    FIO_READ_IOPS=$(echo  "$json" | grep -oP '"read"[^}]*"iops"\s*:\s*\K[0-9.]+' | head -1)
+    FIO_WRITE_IOPS=$(echo "$json" | grep -oP '"write"[^}]*"iops"\s*:\s*\K[0-9.]+' | head -1)
+    FIO_READ_BW=$(echo    "$json" | grep -oP '"read"[^}]*"bw"\s*:\s*\K[0-9.]+' | head -1)
+    FIO_WRITE_BW=$(echo   "$json" | grep -oP '"write"[^}]*"bw"\s*:\s*\K[0-9.]+' | head -1)
+    local r_lat_ns w_lat_ns
+    r_lat_ns=$(echo "$json" | grep -oP '"read".*?"lat_ns".*?"mean"\s*:\s*\K[0-9.]+' | head -1)
+    w_lat_ns=$(echo "$json" | grep -oP '"write".*?"lat_ns".*?"mean"\s*:\s*\K[0-9.]+' | head -1)
+    FIO_READ_LAT_US=$(echo "scale=1; ${r_lat_ns:-0} / 1000" | bc 2>/dev/null || echo "N/A")
+    FIO_WRITE_LAT_US=$(echo "scale=1; ${w_lat_ns:-0} / 1000" | bc 2>/dev/null || echo "N/A")
+    FIO_READ_IOPS="${FIO_READ_IOPS:-0}"
+    FIO_WRITE_IOPS="${FIO_WRITE_IOPS:-0}"
+    FIO_READ_BW="${FIO_READ_BW:-0}"
+    FIO_WRITE_BW="${FIO_WRITE_BW:-0}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPER: Regression comparison
+# ─────────────────────────────────────────────────────────────────────────────
+check_regression() {
+    local base="$1" cur="$2" thresh="$3" name="$4"
+    if [[ "$base" == "0" || "$base" == "N/A" || "$cur" == "N/A" ]]; then
+        warn "$name: baseline or current is 0/N/A, skipping comparison"
+        html_row "$name regression" "baseline=$base current=$cur" "WARN"
+        return 0
+    fi
+    local drop
+    drop=$(echo "scale=1; 100 - ($cur * 100 / $base)" | bc 2>/dev/null || echo "0")
+    local drop_abs="${drop#-}"
+    if (( $(echo "$drop_abs > $thresh" | bc -l) )); then
+        fail "$name dropped ${drop}% (threshold: ${thresh}%)  baseline=$base  current=$cur"
+        html_row "$name regression" "drop=${drop}% baseline=$base current=$cur" "FAIL"
+        return 1
+    else
+        pass "$name within threshold: drop=${drop}%  baseline=$base  current=$cur"
+        html_row "$name regression" "drop=${drop}% baseline=$base current=$cur" "PASS"
+        return 0
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 1: BASELINE DME SNAPSHOT
+# ─────────────────────────────────────────────────────────────────────────────
+section "PHASE 1: BASELINE DME SNAPSHOT"
+html_section "Phase 1 — Baseline DME QoS Snapshot"
+html_table_start
+
+log "Reading DME QoS attribute baseline (before stress)..."
+
+QOS_ENABLE=$(read_dme_attr "0x5130")
+log "DME_QoS_ENABLE = $QOS_ENABLE"
+if [[ "$QOS_ENABLE" == "1" ]]; then
+    pass "QoS monitoring enabled by patch"
+    html_row "DME_QoS_ENABLE (0x5130)" "$QOS_ENABLE" "PASS"
+elif [[ "$QOS_ENABLE" == "N/A" ]]; then
+    warn "Could not read DME_QoS_ENABLE (ufs-utils or BSG unavailable)"
+    html_row "DME_QoS_ENABLE (0x5130)" "N/A" "WARN"
+else
+    fail "DME_QoS_ENABLE = $QOS_ENABLE — patch may not have initialized QoS"
+    html_row "DME_QoS_ENABLE (0x5130)" "$QOS_ENABLE" "FAIL"
+fi
+
+BASE_TX_NAC=$(read_dme_attr "0x5101")
+BASE_TX_OFL=$(read_dme_attr "0x5100")
+BASE_RX_CRC=$(read_dme_attr "0x5111")
+BASE_RX_OFL=$(read_dme_attr "0x5110")
+BASE_PA_INIT=$(read_dme_attr "0x5121")
+BASE_TXRX_QOS=$(read_dme_attr "0x5122")
+BASE_QOS_STATUS=$(read_dme_attr "0x5131")
+
+log "  TX_NAC       = $BASE_TX_NAC"
+log "  TX_DATA_OFL  = $BASE_TX_OFL"
+log "  RX_CRC_ERROR = $BASE_RX_CRC"
+log "  RX_DATA_OFL  = $BASE_RX_OFL"
+log "  PA_INIT      = $BASE_PA_INIT"
+log "  TXRX_QOS_CNT = $BASE_TXRX_QOS"
+log "  QOS_STATUS   = $BASE_QOS_STATUS"
+
+html_row "TX_NAC_RECEIVED (baseline)"  "$BASE_TX_NAC"     "INFO"
+html_row "TX_DATA_OFL (baseline)"      "$BASE_TX_OFL"     "INFO"
+html_row "RX_CRC_ERROR (baseline)"     "$BASE_RX_CRC"     "INFO"
+html_row "RX_DATA_OFL (baseline)"      "$BASE_RX_OFL"     "INFO"
+html_row "PA_INIT_REQUEST (baseline)"  "$BASE_PA_INIT"    "INFO"
+html_row "TXRX_QOS_COUNT (baseline)"   "$BASE_TXRX_QOS"   "INFO"
+html_row "QOS_STATUS (baseline)"       "$BASE_QOS_STATUS" "INFO"
+html_table_end
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 2: REGRESSION BASELINE
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$SKIP_REGRESSION" == false ]]; then
+    section "PHASE 2: REGRESSION BASELINE (Pre-Stress Performance)"
+    html_section "Phase 2 — Regression Baseline (Pre-Stress)"
+    html_table_start
+
+    log "Measuring baseline UFS performance (before any stress)..."
+
+    run_fio "baseline_seqread" "read" "128k" "32" "1" "$REGR_DUR"
+    BASE_SEQ_READ_BW="$FIO_READ_BW"
+    log "  Seq Read BW:  ${BASE_SEQ_READ_BW} KB/s"
+    html_row "Seq Read Throughput (KB/s)" "$BASE_SEQ_READ_BW" "INFO"
+
+    run_fio "baseline_seqwrite" "write" "128k" "32" "1" "$REGR_DUR"
+    BASE_SEQ_WRITE_BW="$FIO_WRITE_BW"
+    log "  Seq Write BW: ${BASE_SEQ_WRITE_BW} KB/s"
+    html_row "Seq Write Throughput (KB/s)" "$BASE_SEQ_WRITE_BW" "INFO"
+
+    run_fio "baseline_randread" "randread" "4k" "32" "4" "$REGR_DUR"
+    BASE_RAND_READ_IOPS="$FIO_READ_IOPS"
+    BASE_RAND_READ_LAT="$FIO_READ_LAT_US"
+    log "  Rand Read IOPS:     ${BASE_RAND_READ_IOPS}"
+    log "  Rand Read Lat (us): ${BASE_RAND_READ_LAT}"
+    html_row "Rand 4K Read IOPS (baseline)"       "$BASE_RAND_READ_IOPS" "INFO"
+    html_row "Rand 4K Read Latency µs (baseline)" "$BASE_RAND_READ_LAT"  "INFO"
+
+    run_fio "baseline_randwrite" "randwrite" "4k" "32" "4" "$REGR_DUR"
+    BASE_RAND_WRITE_IOPS="$FIO_WRITE_IOPS"
+    BASE_RAND_WRITE_LAT="$FIO_WRITE_LAT_US"
+    log "  Rand Write IOPS:     ${BASE_RAND_WRITE_IOPS}"
+    log "  Rand Write Lat (us): ${BASE_RAND_WRITE_LAT}"
+    html_row "Rand 4K Write IOPS (baseline)"       "$BASE_RAND_WRITE_IOPS" "INFO"
+    html_row "Rand 4K Write Latency µs (baseline)" "$BASE_RAND_WRITE_LAT"  "INFO"
+
+    run_fio "baseline_mixed" "randrw" "4k" "16" "4" "$REGR_DUR"
+    BASE_MIX_READ_IOPS="$FIO_READ_IOPS"
+    BASE_MIX_WRITE_IOPS="$FIO_WRITE_IOPS"
+    log "  Mixed Read IOPS:  ${BASE_MIX_READ_IOPS}"
+    log "  Mixed Write IOPS: ${BASE_MIX_WRITE_IOPS}"
+    html_row "Mixed Read IOPS (baseline)"  "$BASE_MIX_READ_IOPS"  "INFO"
+    html_row "Mixed Write IOPS (baseline)" "$BASE_MIX_WRITE_IOPS" "INFO"
+
+    html_table_end
+    pass "Baseline measurements complete"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PHASE 3: STRESS TESTS
+# ─────────────────────────────────────────────────────────────────────────────
+if [[ "$SKIP_STRESS" == false ]]; then
+
+    section "PHASE 3: STRESS TESTS"
+    html_section "Phase 3 — Stress Tests"
+
+    start_uevent_listener
+
+    # 3A: I/O CONGESTION STRESS
+    section "  3A: I/O Congestion Stress (Sequential Overload)"
+    html_table_start
+    log "Running heavy sequential write to saturate UFS link..."
+    PRE_TX_NAC=$(read_dme_attr "0x5101")
+    PRE_TX_OFL=$(read_dme_attr "0x5100")
+
+    adb_shell "$FIO_CMD \
+        --name=congestion_stress \
+        --ioengine=libaio \
+        --rw=write \
+        --bs=512k \
+        --iodepth=64 \
+        --numjobs=4 \
+        --direct=1 \
+        --size=4G \
+        --runtime=$STRESS_DUR \
+        --time_based \
+        --filename=$BLOCK_DEV \
+        --group_reporting \
+        >/dev/null 2>&1 || true"
+
+    POST_TX_NAC=$(read_dme_attr "0x5101")
+    POST_TX_OFL=$(read_dme_attr "0x5100")
+    delta_nac=$(( ${POST_TX_NAC:-0} - ${PRE_TX_NAC:-0} ))
+    delta_ofl=$(( ${POST_TX_OFL:-0} - ${PRE_TX_OFL:-0} ))
+    log "  TX_NAC delta:      +$delta_nac  ($PRE_TX_NAC → $POST_TX_NAC)"
+    log "  TX_DATA_OFL delta: +$delta_ofl  ($PRE_TX_OFL → $POST_TX_OFL)"
+
+    if (( delta_nac > 0 || delta_ofl > 0 )); then
+        pass "Congestion stress induced TX QoS events (NAC=$delta_nac OFL=$delta_ofl)"
+        html_row "Congestion stress — TX_NAC delta"      "+$delta_nac" "PASS"
+        html_row "Congestion stress — TX_DATA_OFL delta" "+$delta_ofl" "PASS"
+    else
+        warn "No TX_NAC/OFL increase observed — link may be handling load fine"
+        html_row "Congestion stress — TX_NAC delta"      "+$delta_nac" "WARN"
+        html_row "Congestion stress — TX_DATA_OFL delta" "+$delta_ofl" "WARN"
+    fi
+    html_table_end
+
+    # 3B: RANDOM I/O STRESS
+    section "  3B: Random I/O Stress (4K Random Hammer)"
+    html_table_start
+    log "Running 4K random read+write to stress signal integrity..."
+    PRE_RX_CRC=$(read_dme_attr "0x5111")
+    PRE_RX_OFL=$(read_dme_attr "0x5110")
+
+    adb_shell "$FIO_CMD \
+        --name=randrw_stress \
+        --ioengine=libaio \
+        --rw=randrw \
+        --rwmixread=50 \
+        --bs=4k \
+        --iodepth=128 \
+        --numjobs=8 \
+        --direct=1 \
+        --size=2G \
+        --runtime=$STRESS_DUR \
+        --time_based \
+        --filename=$BLOCK_DEV \
+        --group_reporting \
+        >/dev/null 2>&1 || true"
+
+    POST_RX_CRC=$(read_dme_attr "0x5111")
+    POST_RX_OFL=$(read_dme_attr "0x5110")
+    delta_crc=$(( ${POST_RX_CRC:-0} - ${PRE_RX_CRC:-0} ))
+    delta_rxofl=$(( ${POST_RX_OFL:-0} - ${PRE_RX_OFL:-0} ))
+    log "  RX_CRC_ERROR delta: +$delta_crc  ($PRE_RX_CRC → $POST_RX_CRC)"
+    log "  RX_DATA_OFL delta:  +$delta_rxofl  ($PRE_RX_OFL → $POST_RX_OFL)"
+
+    html_row "Random I/O stress — RX_CRC delta"      "+$delta_crc"   "INFO"
+    html_row "Random I/O stress — RX_DATA_OFL delta" "+$delta_rxofl" "INFO"
+    pass "Random I/O stress completed"
+    html_table_end
+
+    # 3C: SUSPEND/RESUME CYCLE TEST
+    section "  3C: Suspend/Resume Cycle Test (PA_INIT)"
+    html_table_start
+    log "Running 5 suspend/resume 
